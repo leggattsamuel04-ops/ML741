@@ -22,9 +22,6 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, TargetEncoder
 from sklearn.tree import DecisionTreeClassifier
 
-from assignment4_ensemble import forest_preprocessor
-
-
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "assignment4_results_grouped"
 OUT.mkdir(exist_ok=True)
@@ -32,6 +29,21 @@ SEED = 11
 LABELS = np.arange(10)
 SCORING = {"macro_f1": "f1_macro", "balanced_accuracy": "balanced_accuracy", "accuracy": "accuracy"}
 SIZES = [20, 40, 60, 80, 100, 120, 160, 200]
+
+
+def forest_preprocessor(columns):
+    nominal = ["proto", "service", "state"]
+    numerical = [c for c in columns if c not in nominal]
+    return ColumnTransformer(
+        [
+            ("numeric", "passthrough", numerical),
+            ("nominal", Pipeline([
+                ("missing", SimpleImputer(strategy="constant", fill_value="__MISSING__")),
+                ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ]), nominal),
+        ],
+        sparse_threshold=1.0,
+    )
 
 
 def forest_pipeline(columns):
