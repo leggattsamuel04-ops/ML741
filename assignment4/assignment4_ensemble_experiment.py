@@ -23,6 +23,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
 
+from assignment4_gower import build_preprocessor, neighbours, shepard_predictions
+
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "assignment4_results_grouped"
 OUT.mkdir(exist_ok=True)
@@ -30,6 +32,7 @@ SEED = 11
 LABELS = np.arange(10)
 SCORING = {"macro_f1": "f1_macro", "balanced_accuracy": "balanced_accuracy", "accuracy": "accuracy"}
 SIZES = [20, 40, 60, 80, 100, 120, 160, 200]
+K_VALUES = [1, 2, 3, 5, 7, 9, 11, 21, 31]
 
 
 def forest_preprocessor(columns):
@@ -96,8 +99,57 @@ def oob_size_study(x_select, y_select, columns, fixed, sizes=SIZES):
     return pd.DataFrame(rows)
 
 
+def tune_tree(columns, x_select, y_select, select_groups):
+    search = GridSearchCV(
+        revised_tree_pipeline(columns),
+        {"model__criterion": ["entropy", "gini"],
+         "model__max_depth": [16, 30, None],
+         "model__min_samples_leaf": [1, 5, 15],
+         "model__class_weight": [None, "balanced"]},
+        cv=StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=SEED),
+        scoring=SCORING, refit="macro_f1", return_train_score=True,
+        n_jobs=2, verbose=1,
+    )
+    search.fit(x_select, y_select, groups=select_groups)
+    save_search(search, "tree_tuning_grouped.csv")
+    selected = search.best_params_
+    (OUT / "selected_tree_parameters.json").write_text(
+        json.dumps(selected, indent=2), encoding="utf-8")
+    return selected
+
+
+def tune_knn(x_select, y_select, select_groups, metadata):
+    cv = StratifiedGroupKFold(n_splits=3, shuffle=True, random_state=SEED)
+    fold_rows = []
+    for fold, (fit_pos, hold_pos) in enumerate(cv.split(x_select, y_select, select_groups), 1):
+        x_fit, x_hold = x_select.iloc[fit_pos], x_select.iloc[hold_pos]
+        y_fit, y_hold = y_select.iloc[fit_pos], y_select.iloc[hold_pos]
+        prep, columns = build_preprocessor(x_fit, y_fit, metadata)
+        transformed_fit = prep.fit_transform(x_fit[columns])
+        transformed_hold = prep.transform(x_hold[columns])
+        distances, indices = neighbours(transformed_fit, transformed_hold,
+                                        max(K_VALUES), prep.feature_count_,
+                                        prep.service_index_)
+        for k, pred in shepard_predictions(distances, indices, y_fit, K_VALUES).items():
+            fold_rows.append({"fold": fold, "k": k, "rows": len(y_hold),
+                              "worms": int((y_hold == 7).sum()), **score(y_hold, pred)})
+        print("kNN tuning fold", fold, "complete", flush=True)
+    folds = pd.DataFrame(fold_rows)
+    folds.to_csv(OUT / "knn_tuning_folds.csv", index=False)
+    summary = folds.groupby("k")[["macro_f1", "balanced_accuracy", "accuracy"]].agg(
+        ["mean", "std"])
+    summary.to_csv(OUT / "knn_tuning_grouped.csv")
+    selected = int(summary["macro_f1", "mean"].idxmax())
+    (OUT / "selected_knn.json").write_text(json.dumps({"k": selected}, indent=2),
+                                           encoding="utf-8")
+    print("Selected grouped kNN k=", selected, flush=True)
+    return selected
+
+
 def main():
     evaluation_only = "--evaluation-only" in sys.argv
+    retune_baselines = "--retune-baselines" in sys.argv
+    resume_baselines = "--resume-baselines" in sys.argv
     result_out = OUT
     frame = pd.read_csv(ROOT / "networkTraffic.csv", na_values="?")
     mapping = pd.read_csv(ROOT / "attack_category_map.csv")
@@ -132,18 +184,34 @@ def main():
     (OUT / "split_audit.json").write_text(json.dumps(split_audit, indent=2), encoding="utf-8")
     print("Split audit", split_audit, flush=True)
 
-    if evaluation_only:
+    if evaluation_only or retune_baselines or resume_baselines:
         selected = json.loads((OUT / "selected_parameters.json").read_text(encoding="utf-8"))
     else:
         selected = tune_forest(x_all.columns, x_select, y_select, select_groups)
 
+    metadata_frame = pd.read_csv(ROOT / "features.csv")
+    metadata_frame.columns = metadata_frame.columns.str.strip()
+    metadata = dict(zip(metadata_frame["Name"].str.lower(),
+                        metadata_frame["Type"].str.strip().str.lower()))
+    if evaluation_only or resume_baselines:
+        selected_tree = json.loads((OUT / "selected_tree_parameters.json").read_text(
+            encoding="utf-8"))
+    else:
+        selected_tree = tune_tree(x_all.columns, x_select, y_select, select_groups)
+    if evaluation_only:
+        selected_k = json.loads((OUT / "selected_knn.json").read_text(
+            encoding="utf-8"))["k"]
+    else:
+        selected_k = tune_knn(x_select, y_select, select_groups, metadata)
+
     models = {
-        "Revised A2 tree": revised_tree_pipeline(x_all.columns),
+        "Revised A2 tree": revised_tree_pipeline(x_all.columns).set_params(**selected_tree),
         "Random forest": forest_pipeline(x_all.columns).set_params(**selected),
     }
     cv5 = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=SEED)
     rows = []
-    predictions = {name: np.full(len(y_eval), -1, dtype=int) for name in models}
+    predictions = {name: np.full(len(y_eval), -1, dtype=int)
+                   for name in [*models, "Gower kNN"]}
     for fold, (fit_pos, hold_pos) in enumerate(cv5.split(x_eval, y_eval, eval_groups), 1):
         x_fit, x_hold = x_eval.iloc[fit_pos], x_eval.iloc[hold_pos]
         y_fit, y_hold = y_eval.iloc[fit_pos], y_eval.iloc[hold_pos]
@@ -161,6 +229,20 @@ def main():
                     print("CV5", fold, name, "rows", len(labels), "macro-F1",
                           round(rows[-1]["macro_f1"], 4), flush=True)
 
+        prep, columns = build_preprocessor(x_fit, y_fit, metadata)
+        transformed_fit = prep.fit_transform(x_fit[columns])
+        transformed_hold = prep.transform(x_hold[columns])
+        distances, indices = neighbours(transformed_fit, transformed_hold,
+                                        selected_k, prep.feature_count_,
+                                        prep.service_index_)
+        knn_pred = shepard_predictions(distances, indices, y_fit, [selected_k])[selected_k]
+        predictions["Gower kNN"][hold_pos] = knn_pred
+        rows.append({"fold": fold, "model": "Gower kNN", "partition": "holdout",
+                     "rows": len(y_hold), "worms": int((y_hold == 7).sum()),
+                     **score(y_hold, knn_pred)})
+        print("CV5", fold, "Gower kNN", "rows", len(y_hold), "macro-F1",
+              round(rows[-1]["macro_f1"], 4), flush=True)
+
     scores = pd.DataFrame(rows)
     scores.to_csv(result_out / "cv5_scores.csv", index=False)
     summary = scores.groupby(["model", "partition"])[
@@ -173,6 +255,10 @@ def main():
     (result_out / "paired_difference.json").write_text(json.dumps({
         "fold_differences": delta.tolist(), "mean": float(delta.mean()),
         "sample_sd": float(delta.std(ddof=1))}, indent=2), encoding="utf-8")
+    knn_delta = paired["Random forest"] - paired["Gower kNN"]
+    (result_out / "paired_knn_difference.json").write_text(json.dumps({
+        "fold_differences": knn_delta.tolist(), "mean": float(knn_delta.mean()),
+        "sample_sd": float(knn_delta.std(ddof=1))}, indent=2), encoding="utf-8")
 
     class_rows = []
     screening_rows = []
